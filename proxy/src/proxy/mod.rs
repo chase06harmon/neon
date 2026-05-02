@@ -33,6 +33,7 @@ use crate::pglb::{ClientMode, ClientRequestError};
 use crate::pqproto::{BeMessage, CancelKeyData, StartupMessageParams};
 use crate::rate_limiter::EndpointRateLimiter;
 use crate::stream::{PqStream, Stream};
+use crate::tcp_pool::{TcpPoolCheckout, TcpPoolKey};
 use crate::types::EndpointCacheKey;
 use crate::{auth, compute};
 
@@ -47,7 +48,14 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     endpoint_rate_limiter: Arc<EndpointRateLimiter>,
     common_names: Option<&HashSet<String>>,
     params: &StartupMessageParams,
-) -> Result<(ComputeConnection, oneshot::Sender<Infallible>), ClientRequestError> {
+) -> Result<
+    (
+        ComputeConnection,
+        oneshot::Sender<Infallible>,
+        Option<TcpPoolCheckout>,
+    ),
+    ClientRequestError,
+> {
     let hostname = mode.hostname(client.get_ref());
     // Extract credentials which we're going to use for auth.
     let result = auth_backend
@@ -92,33 +100,66 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut auth_info = compute::AuthInfo::with_auth_keys(creds.keys);
     auth_info.set_startup_params(params, params_compat);
 
-    let backend = auth::Backend::ControlPlane(cplane, creds.info);
-
-    // TODO: callback to pglb
-    let res = connect_auth::connect_to_compute_and_auth(
-        ctx,
-        config,
-        &backend,
-        auth_info,
-        connect_compute::TlsNegotiation::Postgres,
-    )
-    .await;
-
-    let mut node = match res {
-        Ok(node) => node,
+    let pool_key = TcpPoolKey::new(
+        creds.info.endpoint_cache_key(),
+        params.get("database").unwrap_or(user.as_ref()).into(),
+        creds.info.user.clone(),
+    );
+    let startup_cache_key = pool_key.clone();
+    let cancel_user_info = creds.info.clone();
+    let cplane = (*cplane).clone();
+    let (mut node, tcp_pool_checkout, was_reused) = match crate::tcp_pool::manager()
+        .acquire_or_connect(
+            &config.tcp_pool_config,
+            pool_key,
+            ctx.clone(),
+            config,
+            cplane,
+            creds.info,
+            auth_info,
+        )
+        .await
+    {
+        Ok(v) => v,
         Err(e) => Err(client.throw_error(e, Some(ctx)).await)?,
     };
 
     send_client_greeting(ctx, &config.greetings, client);
 
-    let auth::Backend::ControlPlane(_, user_info) = backend else {
-        unreachable!("ensured above");
-    };
-
     let session = cancellation_handler.get_key();
 
-    let (process_id, secret_key) =
-        forward_compute_params_to_client(ctx, *session.key(), client, &mut node.stream).await?;
+    let (process_id, secret_key) = if was_reused {
+        use crate::pqproto::BeMessage;
+        if let Some(startup_params) =
+            crate::tcp_pool::manager().get_startup_params(&startup_cache_key)
+        {
+            for (name, value) in startup_params.iter() {
+                client.write_message(BeMessage::ParameterStatus {
+                    name: name.as_bytes(),
+                    value: value.as_bytes(),
+                });
+            }
+        }
+        client.write_message(BeMessage::BackendKeyData(*session.key()));
+        client.write_message(BeMessage::ReadyForQuery);
+        (0, 0)
+    } else {
+        let (process_id, secret_key, startup_params) =
+            forward_compute_params_to_client(ctx, *session.key(), client, &mut node.stream).await?;
+        crate::tcp_pool::manager().set_startup_params(&startup_cache_key, startup_params);
+        (process_id, secret_key)
+    };
+
+    if let Some(checkout) = tcp_pool_checkout.as_ref() {
+        let reset_query = checkout.reset_query();
+        node = match crate::tcp_pool::reset_session(node, &reset_query).await {
+            Ok(node) => node,
+            Err(err) => Err(client
+                .throw_error(PostgresError::Postgres(err), Some(ctx))
+                .await)?,
+        };
+    }
+
     let hostname = node.hostname.to_string();
 
     let session_id = ctx.session_id();
@@ -136,14 +177,14 @@ pub(crate) async fn handle_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         secret_key,
                     },
                     hostname,
-                    user_info,
+                    user_info: cancel_user_info,
                 },
                 &config.connect_to_compute,
             )
             .await;
     });
 
-    Ok((node, cancel_on_shutdown))
+    Ok((node, cancel_on_shutdown, tcp_pool_checkout))
 }
 
 /// Greet the client with any useful information.
@@ -194,9 +235,10 @@ pub(crate) async fn forward_compute_params_to_client(
     cancel_key_data: CancelKeyData,
     client: &mut PqStream<impl AsyncRead + AsyncWrite + Unpin>,
     compute: &mut StartupStream<TcpStream, RustlsStream>,
-) -> Result<(i32, i32), ClientRequestError> {
+) -> Result<(i32, i32, Vec<(Box<str>, Box<str>)>), ClientRequestError> {
     let mut process_id = 0;
     let mut secret_key = 0;
+    let mut startup_params = Vec::new();
 
     let err = loop {
         // if the client buffer is too large, let's write out some bytes now to save some space
@@ -223,6 +265,10 @@ pub(crate) async fn forward_compute_params_to_client(
                         name: name.as_bytes(),
                         value: value.as_bytes(),
                     });
+                    startup_params.push((
+                        name.to_owned().into_boxed_str(),
+                        value.to_owned().into_boxed_str(),
+                    ));
                 }
             }
             // Forward all notices to the client.
@@ -233,7 +279,7 @@ pub(crate) async fn forward_compute_params_to_client(
             }
             Some(Message::ReadyForQuery(_)) => {
                 client.write_message(BeMessage::ReadyForQuery);
-                return Ok((process_id, secret_key));
+                return Ok((process_id, secret_key, startup_params));
             }
             Some(Message::ErrorResponse(body)) => break postgres_client::Error::db(body),
             Some(_) => break postgres_client::Error::unexpected_message(),
