@@ -136,17 +136,25 @@ def parse_metrics_jsonl(path: str) -> dict[str, float]:
         out["physical_conns_peak"] = float(max(totals))
         out["physical_conns_mean"] = float(sum(totals) / len(totals))
 
-    # Counter deltas: end - start over the whole run.
+    # Counter deltas: end - start over the whole run. If the proxy started
+    # fresh, early samples may report `null` for a metric that the registry
+    # hasn't yet emitted; treat those as implicit 0 so monotonic counters
+    # appear with their full delta.
     for k in counters:
-        first = next((s.get(k) for s in samples if isinstance(s.get(k), (int, float))), None)
         last = None
         for s in reversed(samples):
             v = s.get(k)
             if isinstance(v, (int, float)):
                 last = v
                 break
-        if isinstance(first, (int, float)) and isinstance(last, (int, float)):
-            out[f"{k}_delta"] = float(last) - float(first)
+        if not isinstance(last, (int, float)):
+            continue
+        first = next((s.get(k) for s in samples if isinstance(s.get(k), (int, float))), 0.0)
+        # If the very first non-null sample equals `last`, the metric came
+        # into existence at or before that sample — assume it was 0 before.
+        if first == last:
+            first = 0.0
+        out[f"{k}_delta"] = float(last) - float(first)
 
     return out
 
@@ -159,7 +167,13 @@ def main() -> int:
     p.add_argument("--overflow-limit", type=int, default=0, help="configured overflow budget")
     args = p.parse_args()
 
-    pgbench_logs = sorted(glob.glob(os.path.join(args.run_dir, "pgbench-*.log")))
+    # pgbench -l writes files named `<prefix>.<pid>` and (for parallel jobs)
+    # `<prefix>.<pid>.<thread>`. The transaction-latency rows we want live in
+    # the per-pid base file (not .out / .err / .log).
+    pgbench_logs = sorted(
+        p for p in glob.glob(os.path.join(args.run_dir, "pgbench-*"))
+        if not p.endswith((".out", ".err", ".log"))
+    )
     pgbench_stdouts = sorted(glob.glob(os.path.join(args.run_dir, "pgbench-*.out")))
     metrics_jsonl = os.path.join(args.run_dir, "metrics.jsonl")
 

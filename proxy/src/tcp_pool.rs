@@ -156,6 +156,13 @@ struct KeyPool {
     /// Notified when a per-key slot (or idle conn) frees up. Waiters race
     /// to grab the slot.
     notify: Notify,
+    /// Connection manager for this key, captured at first acquire. Used
+    /// by `reacquire` to open a fresh backend if no idle conn is available
+    /// and per-key + global caps allow. The authoritative session state
+    /// is the caller-supplied `reset_query`, which is replayed after
+    /// connect; the mgr's own `auth_info` only carries the per-key auth
+    /// material (endpoint + role + db credentials).
+    mgr: Mutex<Option<ComputeConnectionManager>>,
 }
 
 impl KeyPool {
@@ -164,6 +171,7 @@ impl KeyPool {
             cfg,
             state: Mutex::new(KeyState::default()),
             notify: Notify::new(),
+            mgr: Mutex::new(None),
         }
     }
 }
@@ -599,8 +607,14 @@ impl TcpPoolManager {
                     return Ok((slot, outcome));
                 }
                 if state.occupancy() < cfg.max_conns_per_key as u32 {
+                    // `state.connecting` enforces per-key cap math; it
+                    // covers conns that are reserved but might still be
+                    // waiting on the global permit. The gauge
+                    // `connections{state="connecting"}` only counts
+                    // conns whose TCP connect is genuinely in flight
+                    // (i.e. a global permit is held), so it's bumped
+                    // later in `Action::Reserve` after acquire_capacity.
                     state.connecting += 1;
-                    m.connections.inc(TcpPoolConnectionState::Connecting);
                     Action::Reserve
                 } else {
                     Action::Wait
@@ -614,7 +628,6 @@ impl TcpPoolManager {
                         Err(e) => {
                             let mut state = pool.state.lock();
                             state.connecting = state.connecting.saturating_sub(1);
-                            m.connections.dec(TcpPoolConnectionState::Connecting);
                             drop(state);
                             pool.notify.notify_one();
                             return Err(e);
@@ -622,6 +635,10 @@ impl TcpPoolManager {
                     };
 
                     let is_overflow = grant.permit.is_overflow;
+
+                    // Permit held — TCP connect is now actually starting.
+                    // Bump the gauge so observers see one more "connecting".
+                    m.connections.inc(TcpPoolConnectionState::Connecting);
 
                     let conn = match mgr.connect().await {
                         Ok(c) => c,
@@ -724,6 +741,17 @@ impl TcpPoolManager {
         };
 
         let pool = self.get_or_create_pool(key.clone(), *config);
+        // Cache the connection manager on the per-key pool so a later
+        // `reacquire` can open a fresh backend under the global cap when
+        // its idle queue is empty. The first session to touch the key
+        // wins; subsequent sessions reuse the same mgr because session
+        // state divergence is reconciled by `reset_session(reset_query)`.
+        {
+            let mut slot = pool.mgr.lock();
+            if slot.is_none() {
+                *slot = Some(mgr.clone());
+            }
+        }
         let started = Instant::now();
         let result = self.checkout(&pool, &mgr, config).await;
 
@@ -763,8 +791,11 @@ impl TcpPoolManager {
         reset_query: Arc<str>,
     ) -> Result<(ComputeConnection, TcpPoolCheckout), AcquireError> {
         // Reacquire is only legal after a successful initial acquire; the
-        // KeyPool must already exist. We grab the conn from the idle queue
-        // associated with the key.
+        // KeyPool must already exist. The cached mgr lets us fall through
+        // to the full checkout path when this key's idle queue is empty
+        // — without that, a key with 0 idle and 0 occupancy would block
+        // forever waiting for a notify that only fires for releases on
+        // the same key, even though the global cap may have headroom.
         let pool = self
             .inner
             .pools
@@ -772,31 +803,20 @@ impl TcpPoolManager {
             .map(|p| p.clone())
             .expect("pool key must exist before reacquire");
         let cfg = pool.cfg;
+        let mgr = pool
+            .mgr
+            .lock()
+            .clone()
+            .expect("mgr must be cached on first acquire_or_connect");
+
         let started = Instant::now();
+        let result = self.checkout(&pool, &mgr, &cfg).await;
         let m = &Metrics::get().proxy.tcp_pool;
-        let deadline = started + cfg.checkout_timeout;
 
-        loop {
-            let notified = pool.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let popped: Option<PooledCompute> = {
-                let mut state = pool.state.lock();
-                if let Some(mut slot) = state.idle.pop_front() {
-                    state.checked_out += 1;
-                    m.connections.dec(TcpPoolConnectionState::Idle);
-                    m.connections.inc(TcpPoolConnectionState::CheckedOut);
-                    slot.fresh = false;
-                    Some(slot)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(mut slot) = popped {
+        match result {
+            Ok((mut slot, outcome)) => {
                 let was_overflow = slot.permit.is_overflow;
-                let mut conn = slot.conn.take().expect("idle slot must hold a conn");
+                let mut conn = slot.conn.take().expect("slot must hold a conn at checkout");
 
                 let discard = |pool: &Arc<KeyPool>, slot: PooledCompute, was_overflow: bool| {
                     let mut state = pool.state.lock();
@@ -810,16 +830,21 @@ impl TcpPoolManager {
                     pool.notify.notify_one();
                 };
 
-                if let Err(e) = drain_fresh_startup(&mut conn).await {
+                // Drain leftover startup messages on a freshly-opened conn
+                // (no-op for a slot that came back from idle).
+                if slot.fresh
+                    && let Err(e) = drain_fresh_startup(&mut conn).await
+                {
                     discard(&pool, slot, was_overflow);
                     self.observe_outcome(started, TcpPoolCheckoutOutcome::Failed);
                     return Err(AcquireError::Startup(e));
                 }
+                slot.fresh = false;
+
                 // Reset session state (RESET ALL + replay startup params)
-                // before handing the conn over to the next transaction.
-                // This is the "session hygiene" guarantee for transaction-
-                // mode pooling: a borrower never sees the previous tenant's
-                // GUCs, temp tables, or `SET LOCAL` leftovers.
+                // so the borrower never sees the previous tenant's GUCs,
+                // temp tables, or `SET LOCAL` leftovers. This is the
+                // "session hygiene" guarantee for transaction-mode pooling.
                 let conn = match reset_session(conn, &reset_query).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -828,8 +853,8 @@ impl TcpPoolManager {
                         return Err(AcquireError::Startup(e));
                     }
                 };
-                self.observe_outcome(started, TcpPoolCheckoutOutcome::ImmediateHit);
-                return Ok((
+                self.observe_outcome(started, outcome);
+                Ok((
                     conn,
                     TcpPoolCheckout {
                         key,
@@ -838,18 +863,16 @@ impl TcpPoolManager {
                         was_overflow,
                         reset_query: reset_query.clone(),
                     },
-                ));
+                ))
             }
-
-            let now = Instant::now();
-            if now >= deadline {
-                self.observe_outcome(started, TcpPoolCheckoutOutcome::Timeout);
-                return Err(AcquireError::CheckoutTimeout(cfg.checkout_timeout));
-            }
-            let remaining = deadline - now;
-            if tokio::time::timeout(remaining, notified).await.is_err() {
-                self.observe_outcome(started, TcpPoolCheckoutOutcome::Timeout);
-                return Err(AcquireError::CheckoutTimeout(cfg.checkout_timeout));
+            Err(e) => {
+                let outcome = match &e {
+                    AcquireError::CheckoutTimeout(_) => TcpPoolCheckoutOutcome::Timeout,
+                    AcquireError::PoolExhausted => TcpPoolCheckoutOutcome::Rejected,
+                    _ => TcpPoolCheckoutOutcome::Failed,
+                };
+                self.observe_outcome(started, outcome);
+                Err(e)
             }
         }
     }
