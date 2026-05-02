@@ -32,15 +32,17 @@ use clashmap::ClashMap;
 use futures::TryStreamExt;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use postgres_client::connect_raw::StartupStream;
 use postgres_protocol::message::backend::Message;
 use rand::Rng;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 use crate::auth::Backend;
 use crate::auth::backend::{ComputeUserInfo, MaybeOwned};
-use crate::compute::{AuthInfo, ComputeConnection};
+use crate::compute::{AuthInfo, ComputeConnection, MaybeRustlsStream};
 use crate::config::{ProxyConfig, TcpPoolConfig};
 use crate::context::RequestContext;
 use crate::error::{ErrorKind, ReportableError, UserFacingError};
@@ -48,6 +50,7 @@ use crate::metrics::{
     Bool, Metrics, TcpPoolCheckoutGroup, TcpPoolCheckoutOutcome, TcpPoolConnectionState,
     TcpPoolOverflowOutcome, TcpPoolReleaseGroup, TcpPoolReleaseReason,
 };
+use crate::pqproto;
 use crate::proxy::connect_auth::{self, AuthError};
 use crate::proxy::connect_compute;
 use crate::types::{DbName, EndpointCacheKey, RoleName};
@@ -190,11 +193,23 @@ pub(crate) struct TcpPoolCheckout {
     slot: Option<PooledCompute>,
     /// Slot was acquired from the overflow budget?
     was_overflow: bool,
+    /// `RESET ALL` + replay-startup-params query, captured at acquire time
+    /// so transaction-mode reacquires reset the borrowed conn before use.
+    /// Threaded through to callers via [`Self::reset_query`].
+    reset_query: Arc<str>,
 }
 
 impl TcpPoolCheckout {
     pub(crate) fn key(&self) -> &TcpPoolKey {
         &self.key
+    }
+
+    /// Session-reset query captured for this checkout. The transaction-mode
+    /// loop hands this to [`TcpPoolManager::reacquire`] so each new compute
+    /// conn pulled from the idle queue is reset to the client's startup
+    /// state before the next transaction runs.
+    pub(crate) fn reset_query(&self) -> Arc<str> {
+        self.reset_query.clone()
     }
 
     /// Backwards-compatible thin wrapper over [`Self::release_with_reason`].
@@ -317,6 +332,78 @@ async fn drain_fresh_startup(conn: &mut ComputeConnection) -> Result<(), postgre
             None => return Err(postgres_client::Error::closed()),
         }
     }
+}
+
+async fn write_simple_query<S>(stream: &mut S, query: &str) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_u8(b'Q').await?;
+    stream.write_u32((query.len() + 5) as u32).await?;
+    stream.write_all(query.as_bytes()).await?;
+    stream.write_u8(0).await?;
+    stream.flush().await
+}
+
+async fn drain_simple_query<S>(stream: &mut S) -> Result<u8, postgres_client::Error>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    loop {
+        let (tag, body) = pqproto::read_message(stream, &mut buf, 65536)
+            .await
+            .map_err(postgres_client::Error::io)?;
+
+        match tag {
+            b'Z' if body.len() == 1 => return Ok(body[0]),
+            b'Z' => return Err(postgres_client::Error::unexpected_message()),
+            b'C' | b'D' | b'I' | b'N' | b'S' | b'T' => {}
+            b'E' => return Err(postgres_client::Error::unexpected_message()),
+            _ => return Err(postgres_client::Error::unexpected_message()),
+        }
+    }
+}
+
+async fn reset_raw_session(
+    stream: &mut MaybeRustlsStream,
+    reset_query: &str,
+) -> Result<(), postgres_client::Error> {
+    write_simple_query(stream, reset_query)
+        .await
+        .map_err(postgres_client::Error::io)?;
+    let status = drain_simple_query(stream).await?;
+    if status == b'I' {
+        Ok(())
+    } else {
+        Err(postgres_client::Error::unexpected_message())
+    }
+}
+
+pub(crate) async fn reset_session(
+    conn: ComputeConnection,
+    reset_query: &str,
+) -> Result<ComputeConnection, postgres_client::Error> {
+    let ComputeConnection {
+        stream,
+        aux,
+        hostname,
+        ssl_mode,
+        socket_addr,
+        guage,
+    } = conn;
+
+    let mut raw_stream = stream.into_framed().into_inner();
+    reset_raw_session(&mut raw_stream, reset_query).await?;
+
+    Ok(ComputeConnection {
+        stream: StartupStream::new(raw_stream),
+        aux,
+        hostname,
+        ssl_mode,
+        socket_addr,
+        guage,
+    })
 }
 
 pub(crate) struct TcpPoolManager {
@@ -624,6 +711,7 @@ impl TcpPoolManager {
             return Ok((conn, None, false));
         }
 
+        let reset_query = Arc::<str>::from(auth_info.tcp_pool_session_reset_query());
         let backend = Arc::new(Backend::ControlPlane(MaybeOwned::Owned(cplane), user_info));
         let mgr = ComputeConnectionManager {
             ctx,
@@ -649,6 +737,7 @@ impl TcpPoolManager {
                         pool,
                         slot: Some(slot),
                         was_overflow: is_overflow,
+                        reset_query,
                     }),
                     was_reused,
                 ))
@@ -668,6 +757,7 @@ impl TcpPoolManager {
     pub(crate) async fn reacquire(
         &self,
         key: TcpPoolKey,
+        reset_query: Arc<str>,
     ) -> Result<(ComputeConnection, TcpPoolCheckout), AcquireError> {
         // Reacquire is only legal after a successful initial acquire; the
         // KeyPool must already exist. We grab the conn from the idle queue
@@ -704,8 +794,8 @@ impl TcpPoolManager {
             if let Some(mut slot) = popped {
                 let was_overflow = slot.permit.is_overflow;
                 let mut conn = slot.conn.take().expect("idle slot must hold a conn");
-                if let Err(e) = drain_fresh_startup(&mut conn).await {
-                    // Drainage failed: discard the conn (slot drops permit).
+
+                let discard = |pool: &Arc<KeyPool>, slot: PooledCompute, was_overflow: bool| {
                     let mut state = pool.state.lock();
                     state.checked_out = state.checked_out.saturating_sub(1);
                     m.connections.dec(TcpPoolConnectionState::CheckedOut);
@@ -715,12 +805,26 @@ impl TcpPoolManager {
                     drop(state);
                     drop(slot);
                     pool.notify.notify_one();
+                };
+
+                if let Err(e) = drain_fresh_startup(&mut conn).await {
+                    discard(&pool, slot, was_overflow);
                     self.observe_outcome(started, TcpPoolCheckoutOutcome::Failed);
-                    // If the conn was already used (fresh==false this round),
-                    // drainage is a no-op success; we only get here on a
-                    // genuine startup-stream issue.
                     return Err(AcquireError::Startup(e));
                 }
+                // Reset session state (RESET ALL + replay startup params)
+                // before handing the conn over to the next transaction.
+                // This is the "session hygiene" guarantee for transaction-
+                // mode pooling: a borrower never sees the previous tenant's
+                // GUCs, temp tables, or `SET LOCAL` leftovers.
+                let conn = match reset_session(conn, &reset_query).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        discard(&pool, slot, was_overflow);
+                        self.observe_outcome(started, TcpPoolCheckoutOutcome::Failed);
+                        return Err(AcquireError::Startup(e));
+                    }
+                };
                 self.observe_outcome(started, TcpPoolCheckoutOutcome::ImmediateHit);
                 return Ok((
                     conn,
@@ -729,6 +833,7 @@ impl TcpPoolManager {
                         pool: pool.clone(),
                         slot: Some(slot),
                         was_overflow,
+                        reset_query: reset_query.clone(),
                     },
                 ));
             }
