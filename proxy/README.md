@@ -102,6 +102,101 @@ User can pass several optional headers that will affect resulting json.
 2. `Neon-Array-Mode: true`. Return postgres rows as arrays instead of objects. That is more compact representation and also helps in some edge
 cases where it is hard to use rows represented as objects (e.g. when several fields have the same name).
 
+## TCP connection pool
+
+The proxy embeds a TCP/Postgres connection pool keyed by
+`(endpoint, database, role)`. With pooling on, an incoming client
+session can either reuse a previously opened backend connection or
+trigger a new one, subject to per-key, global, and overflow caps.
+
+The pool lives in `proxy/src/tcp_pool.rs`. It enforces a real global
+cap on physical compute connections via a process-wide
+`tokio::sync::Semaphore`: every backend connection holds a permit for
+its entire lifetime, regardless of how many `(endpoint, db, role)`
+keys exist. The previous implementation only enforced a per-key cap,
+so the effective ceiling was `num_keys × max_conns_per_key`.
+
+### Flags
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--tcp-pool-enabled` | `false` | Master switch. When off, sessions take the legacy direct-connect path and the global cap does not apply. |
+| `--tcp-pool-mode` | `session` | `session` holds a backend conn for the whole client session. `transaction` releases at every `ReadyForQuery('I')` and re-acquires for the next transaction (PgBouncer-style). |
+| `--tcp-pool-max-total-conns` | `20000` | Hard ceiling on physical compute connections, enforced via the global semaphore. |
+| `--tcp-pool-max-conns-per-key` | `20` | Per-key cap on physical conns (idle + connecting + checked-out). |
+| `--tcp-pool-overflow-limit` | `0` | Optional controlled overflow on top of the global cap. Overflow conns are short-lived (never returned to the idle queue). With `0`, saturated pools queue up to the checkout timeout and then return an explicit error. |
+| `--tcp-pool-checkout-timeout` | `1s` | Bounded deadline for the entire checkout path (per-key wait + global wait + backend connect). Replaces the previous 365-day timeout. |
+| `--tcp-pool-idle-timeout` | `5m` | Reserved for the idle-eviction worker. |
+| `--tcp-pool-fallback-direct-connect` | `true` | Legacy flag. The pool no longer bypasses the global cap on saturation; this flag is accepted for backwards compatibility but does not alter pool behavior. Use `--tcp-pool-overflow-limit` for controlled overflow. |
+
+### Metrics
+
+All metrics live under the `proxy_tcp_pool_` prefix and use closed
+enum labels (no per-endpoint or per-tenant cardinality):
+
+- `proxy_tcp_pool_connections{state}` — gauge.
+  States: `idle`, `checked_out`, `connecting`, `overflow`.
+- `proxy_tcp_pool_checkout_total{outcome}` — counter.
+  Outcomes: `immediate_hit`, `miss_created`, `queued_hit`,
+  `queued_created`, `overflow`, `timeout`, `rejected`, `failed`.
+- `proxy_tcp_pool_checkout_wait_seconds{outcome}` — histogram of
+  total checkout latency, split by outcome.
+- `proxy_tcp_pool_release_total{reason,reusable}` — counter.
+  Release reasons include `clean_session_end`,
+  `clean_transaction_boundary`, `frontend_terminate`,
+  `backend_closed`, `io_error`, `dirty_session_state`,
+  `reset_failed`, `idle_eviction`, `global_pressure_eviction`,
+  `lifetime_exceeded`. `reusable` is `true`/`false`.
+- `proxy_tcp_pool_overflow_connections_total{outcome}` — counter
+  (`taken` / `refused`).
+- `proxy_tcp_pool_evictions_total{reason}` — counter (registered
+  for the upcoming idle-eviction worker; not yet emitted).
+- `proxy_tcp_pool_global_pressure` — gauge, `1` if the global
+  semaphore is saturated, `0` otherwise.
+
+Endpoint IDs, database names, role names, and compute IDs are kept
+internal — they never appear as Prometheus labels.
+
+### Running locally with the pool on
+
+Build with `--features testing` and pass the pool flags. For example:
+
+```sh
+RUST_LOG=proxy LOGFMT=text cargo run -p proxy --bin proxy --features testing -- \
+  --auth-backend postgres \
+  --auth-endpoint 'postgresql://postgres:proxy-postgres@127.0.0.1:5432/postgres' \
+  -c server.crt -k server.key \
+  --tcp-pool-enabled true \
+  --tcp-pool-max-total-conns 16 \
+  --tcp-pool-max-conns-per-key 8 \
+  --tcp-pool-checkout-timeout 250ms \
+  --tcp-pool-overflow-limit 0
+```
+
+Hit the proxy with multiple sessions and watch the metrics:
+
+```sh
+curl -s http://127.0.0.1:7001/metrics | grep ^proxy_tcp_pool_
+```
+
+### Benchmarks
+
+The Phase 1 load-balancing benchmark suite lives in
+[`benchmarks/lb/`](../benchmarks/lb/README.md) and currently ships
+two scenarios:
+
+- `BENCH=global_cap` — verifies that the peak number of physical
+  compute connections is bounded by `--tcp-pool-max-total-conns`
+  even when many endpoints together demand more.
+- `BENCH=checkout_deadline` — verifies that a saturated pool
+  returns explicit `timeout` outcomes instead of blocking forever.
+
+`DRY_RUN=1` validates plumbing without invoking pgbench. Other
+scenarios from the brief (`noisy_neighbor`, `transaction_multiplex`,
+etc.) are scaffolded but report `not implemented`; they depend on
+endpoint-fairness, transaction-mode metrics, and multi-compute work
+that is not part of this phase.
+
 ## Test proxy locally
 
 For an end-to-end local setup that uses `neon_local`-managed computes

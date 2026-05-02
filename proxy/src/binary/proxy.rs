@@ -338,15 +338,32 @@ struct TcpPoolArgs {
     #[clap(long, default_value_t = 20)]
     tcp_pool_max_conns_per_key: usize,
 
-    /// Maximum number of pooled backend connections across all keys.
+    /// Hard global cap on pooled backend connections across all pool keys.
+    /// Enforced via a global semaphore; a new physical compute connection
+    /// must acquire a permit and holds it for its entire lifetime.
     #[clap(long, default_value_t = 20000)]
     tcp_pool_max_total_conns: usize,
+
+    /// Controlled overflow budget on top of `--tcp-pool-max-total-conns`.
+    /// Overflow connections are short-lived (not pooled across checkouts).
+    /// Set to 0 to disable; saturated pools then queue up to the checkout
+    /// timeout and return an explicit error instead of bypassing the cap.
+    #[clap(long, default_value_t = 0)]
+    tcp_pool_overflow_limit: usize,
 
     /// How long idle pooled backend connections should be kept.
     #[clap(long, default_value = "5m", value_parser = humantime::parse_duration)]
     tcp_pool_idle_timeout: tokio::time::Duration,
 
-    /// If pool acquire fails, fallback to the existing direct-connect path.
+    /// Bounded deadline for a pool checkout. Includes per-key wait,
+    /// global-capacity wait and backend connect time. Defaults to 1s.
+    #[clap(long, default_value = "1s", value_parser = humantime::parse_duration)]
+    tcp_pool_checkout_timeout: tokio::time::Duration,
+
+    /// Legacy fallback flag. The pool no longer bypasses the global cap on
+    /// failure; the flag is accepted for backwards compatibility but does
+    /// not alter pool behavior. See `--tcp-pool-overflow-limit` for the
+    /// supported controlled-overflow path.
     #[clap(long, default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set)]
     tcp_pool_fallback_direct_connect: bool,
 
@@ -762,7 +779,9 @@ fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
         mode: args.tcp_pool.tcp_pool_mode.into(),
         max_conns_per_key: args.tcp_pool.tcp_pool_max_conns_per_key,
         max_total_conns: args.tcp_pool.tcp_pool_max_total_conns,
+        overflow_limit: args.tcp_pool.tcp_pool_overflow_limit,
         idle_timeout: args.tcp_pool.tcp_pool_idle_timeout,
+        checkout_timeout: args.tcp_pool.tcp_pool_checkout_timeout,
         fallback_direct_connect: args.tcp_pool.tcp_pool_fallback_direct_connect,
     };
     let authentication_config = AuthenticationConfig {

@@ -285,7 +285,9 @@ fn build_config(args: &LocalProxyCliArgs) -> anyhow::Result<&'static ProxyConfig
             mode: crate::config::TcpPoolMode::Session,
             max_conns_per_key: 0,
             max_total_conns: 0,
+            overflow_limit: 0,
             idle_timeout: Duration::ZERO,
+            checkout_timeout: Duration::from_secs(1),
             fallback_direct_connect: false,
         },
         authentication_config: AuthenticationConfig {

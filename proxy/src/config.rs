@@ -92,9 +92,29 @@ pub enum TcpPoolMode {
 pub struct TcpPoolConfig {
     pub enabled: bool,
     pub mode: TcpPoolMode,
+    /// Per-key (endpoint+db+role) cap on physical compute connections.
     pub max_conns_per_key: usize,
+    /// Hard global cap on physical compute connections summed across all
+    /// pool keys, except for the controlled `overflow_limit` budget.
     pub max_total_conns: usize,
+    /// Optional controlled overflow budget on top of `max_total_conns`. A
+    /// connection that holds an overflow permit is short-lived: it is
+    /// never returned to the idle pool and is closed at session end.
+    pub overflow_limit: usize,
+    /// Idle eviction window for pooled connections. Reserved for the
+    /// upcoming idle-eviction worker; unused by the cap-enforcement
+    /// fast path today.
+    #[allow(dead_code)]
     pub idle_timeout: Duration,
+    /// Bounded checkout deadline. The whole acquire path (waiting on the
+    /// per-key queue, waiting on global capacity, opening the backend
+    /// connection) must complete within this duration. Saturated pools
+    /// will return an explicit timeout instead of blocking forever.
+    pub checkout_timeout: Duration,
+    /// Legacy knob retained for backwards compatibility. Ignored by the
+    /// pool — a saturated pool now returns an explicit checkout error or
+    /// uses the controlled overflow budget instead of a naive bypass.
+    #[allow(dead_code)]
     pub fallback_direct_connect: bool,
 }
 

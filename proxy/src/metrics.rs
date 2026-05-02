@@ -147,8 +147,118 @@ pub struct ProxyMetrics {
     #[metric(namespace = "connect_compute_lock")]
     pub connect_compute_lock: ApiLockMetrics,
 
+    /// Embedded TCP/Postgres connection pool.
+    #[metric(namespace = "tcp_pool")]
+    pub tcp_pool: TcpPoolMetrics,
+
     #[metric(namespace = "scram_pool")]
     pub scram_pool: OnceLockWrapper<Arc<ThreadPoolMetrics>>,
+}
+
+#[derive(MetricGroup)]
+#[metric(new())]
+pub struct TcpPoolMetrics {
+    /// Number of physical compute connections, by state.
+    pub connections: GaugeVec<StaticLabelSet<TcpPoolConnectionState>>,
+
+    /// Number of pool checkouts, by outcome.
+    pub checkout_total: CounterVec<TcpPoolCheckoutSet>,
+
+    /// Time spent in the pool checkout path (per-key wait + global wait +
+    /// connect time), by outcome.
+    // largest bucket = 2^15 * 1e-4 = ~3.3s, plenty for a sub-second timeout.
+    #[metric(metadata = Thresholds::exponential_buckets(1e-4, 2.0))]
+    pub checkout_wait_seconds: HistogramVec<TcpPoolCheckoutSet, 16>,
+
+    /// Number of connection releases, by reason and whether the
+    /// connection was considered reusable.
+    pub release_total: CounterVec<TcpPoolReleaseSet>,
+
+    /// Number of overflow connection attempts, by outcome.
+    pub overflow_connections_total: CounterVec<StaticLabelSet<TcpPoolOverflowOutcome>>,
+
+    /// Number of pool evictions (idle / lifetime / pressure).
+    pub evictions_total: CounterVec<StaticLabelSet<TcpPoolEvictionReason>>,
+
+    /// 1 if the global pool semaphore is fully consumed, 0 otherwise.
+    pub global_pressure: Gauge,
+}
+
+impl Default for TcpPoolMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(FixedCardinalityLabel, Copy, Clone, Debug)]
+#[label(singleton = "state")]
+pub enum TcpPoolConnectionState {
+    Idle,
+    CheckedOut,
+    Connecting,
+    Overflow,
+}
+
+#[derive(FixedCardinalityLabel, Copy, Clone, Debug)]
+pub enum TcpPoolCheckoutOutcome {
+    /// Idle connection available, returned without waiting.
+    ImmediateHit,
+    /// No idle connection; created a new one immediately.
+    MissCreated,
+    /// Waited for a slot, then got an idle connection.
+    QueuedHit,
+    /// Waited for a slot, then created a new connection.
+    QueuedCreated,
+    /// Used the controlled overflow budget.
+    Overflow,
+    /// Checkout timed out before a slot became available.
+    Timeout,
+    /// Pool is at capacity and overflow is disabled.
+    Rejected,
+    /// Backend connect / auth / IO failure during checkout.
+    Failed,
+}
+
+#[derive(LabelGroup, Copy, Clone)]
+#[label(set = TcpPoolCheckoutSet)]
+pub struct TcpPoolCheckoutGroup {
+    pub outcome: TcpPoolCheckoutOutcome,
+}
+
+#[derive(FixedCardinalityLabel, Copy, Clone, Debug)]
+pub enum TcpPoolReleaseReason {
+    CleanSessionEnd,
+    CleanTransactionBoundary,
+    FrontendTerminate,
+    BackendClosed,
+    IoError,
+    DirtySessionState,
+    ResetFailed,
+    IdleEviction,
+    GlobalPressureEviction,
+    LifetimeExceeded,
+}
+
+#[derive(LabelGroup)]
+#[label(set = TcpPoolReleaseSet)]
+pub struct TcpPoolReleaseGroup {
+    pub reason: TcpPoolReleaseReason,
+    pub reusable: Bool,
+}
+
+#[derive(FixedCardinalityLabel, Copy, Clone, Debug)]
+#[label(singleton = "outcome")]
+pub enum TcpPoolOverflowOutcome {
+    Taken,
+    Refused,
+}
+
+#[derive(FixedCardinalityLabel, Copy, Clone, Debug)]
+#[label(singleton = "reason")]
+pub enum TcpPoolEvictionReason {
+    IdleTimeout,
+    Lifetime,
+    Pressure,
 }
 
 /// A Wrapper over [`OnceLock`] to implement [`MetricGroup`].
