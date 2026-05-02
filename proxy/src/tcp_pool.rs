@@ -365,10 +365,13 @@ where
     }
 }
 
-async fn reset_raw_session(
-    stream: &mut MaybeRustlsStream,
+async fn reset_raw_session<S>(
+    stream: &mut S,
     reset_query: &str,
-) -> Result<(), postgres_client::Error> {
+) -> Result<(), postgres_client::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     write_simple_query(stream, reset_query)
         .await
         .map_err(postgres_client::Error::io)?;
@@ -1069,5 +1072,171 @@ mod tests {
         let _held = s.clone().acquire_owned().await.unwrap();
         let res = tokio::time::timeout(Duration::from_millis(50), s.clone().acquire_owned()).await;
         assert!(res.is_err(), "must time out instead of blocking");
+    }
+
+    // ----------------------------------------------------------------------
+    // Session-reset integration tests.
+    //
+    // These drive the helpers from the `session-params` merge against a
+    // fake Postgres backend constructed with `tokio::io::duplex`. They
+    // exercise `write_simple_query`, `drain_simple_query`, and
+    // `reset_raw_session` over the actual codepath the pool uses on
+    // reacquire — without needing a live compute or TLS.
+    //
+    // To make `reset_raw_session` reachable from a stubbed stream the
+    // function is generic over `S: AsyncRead + AsyncWrite + Unpin`; in
+    // production the substituted `S` is `MaybeRustlsStream`.
+    // ----------------------------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+    /// Build a Postgres v3 wire frame: tag (1B) + length (BE u32, includes
+    /// itself) + body. Used by tests to script a fake backend.
+    fn pg_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 4 + body.len());
+        out.push(tag);
+        let len = (4 + body.len()) as u32;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// `write_simple_query` emits a well-formed `'Q'` frame:
+    /// `'Q' | u32_be(len = 4 + body.len() + 1) | body | 0x00`.
+    #[tokio::test]
+    async fn write_simple_query_emits_correct_frame() {
+        let mut buf: Vec<u8> = Vec::new();
+        super::write_simple_query(&mut buf, "SELECT 1")
+            .await
+            .unwrap();
+
+        assert_eq!(buf[0], b'Q', "tag must be 'Q'");
+        let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        // Length is inclusive of the 4-byte length field itself, the body,
+        // and the null terminator — but not the tag.
+        assert_eq!(len, 4 + "SELECT 1".len() + 1);
+        assert_eq!(&buf[5..5 + "SELECT 1".len()], b"SELECT 1");
+        assert_eq!(buf[5 + "SELECT 1".len()], 0, "must be null-terminated");
+        // Nothing trailing.
+        assert_eq!(buf.len(), 1 + 4 + "SELECT 1".len() + 1);
+    }
+
+    /// `drain_simple_query` skips intermediate response messages and
+    /// returns the ReadyForQuery status byte.
+    #[tokio::test]
+    async fn drain_simple_query_skips_to_ready_for_query() {
+        let (mut server, mut client) = tokio::io::duplex(4096);
+
+        // Server replies as Postgres would for `RESET ALL`:
+        //   CommandComplete('C', "RESET\0") | ReadyForQuery('Z', 'I')
+        let mut script = Vec::new();
+        script.extend(pg_frame(b'C', b"RESET\0"));
+        script.extend(pg_frame(b'Z', &[b'I']));
+        server.write_all(&script).await.unwrap();
+        server.shutdown().await.ok();
+        drop(server);
+
+        let status = super::drain_simple_query(&mut client).await.unwrap();
+        assert_eq!(status, b'I');
+    }
+
+    /// `drain_simple_query` skips a richer mix of intermediate messages
+    /// (NoticeResponse, ParameterStatus, RowDescription, DataRow, plus
+    /// multiple CommandCompletes for a multi-statement query). This is
+    /// the actual response shape for the merged reset query
+    /// `RESET ALL; SELECT pg_catalog.set_config(...)`.
+    #[tokio::test]
+    async fn drain_simple_query_handles_multi_statement_pipeline() {
+        let (mut server, mut client) = tokio::io::duplex(8192);
+
+        let mut script = Vec::new();
+        script.extend(pg_frame(b'N', b"\0")); // NoticeResponse (terminator-only body)
+        script.extend(pg_frame(b'C', b"RESET\0")); // statement 1: RESET ALL
+        script.extend(pg_frame(b'S', b"client_min_messages\0notice\0")); // ParameterStatus
+        script.extend(pg_frame(b'T', b"\0\0")); // RowDescription stub
+        script.extend(pg_frame(b'D', b"\0\0\0\0")); // DataRow stub
+        script.extend(pg_frame(b'C', b"SELECT 1\0")); // statement 2: set_config
+        script.extend(pg_frame(b'Z', &[b'I']));
+        server.write_all(&script).await.unwrap();
+        server.shutdown().await.ok();
+        drop(server);
+
+        let status = super::drain_simple_query(&mut client).await.unwrap();
+        assert_eq!(status, b'I');
+    }
+
+    /// An ErrorResponse from the server must surface as a postgres_client
+    /// error, not be silently absorbed.
+    #[tokio::test]
+    async fn drain_simple_query_returns_err_on_error_response() {
+        let (mut server, mut client) = tokio::io::duplex(1024);
+        // Minimal ErrorResponse: 'E' | len 5 | terminator.
+        server.write_all(&pg_frame(b'E', &[0])).await.unwrap();
+        drop(server);
+
+        let res = super::drain_simple_query(&mut client).await;
+        assert!(res.is_err(), "ErrorResponse must propagate");
+    }
+
+    /// End-to-end: `reset_raw_session` writes a `RESET ALL` query frame to
+    /// the stream and consumes the server's CommandComplete +
+    /// ReadyForQuery('I') response, returning Ok(()).
+    #[tokio::test]
+    async fn reset_raw_session_round_trip_idle() {
+        let (mut server, mut client) = tokio::io::duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            // Read the 'Q' frame the client sent.
+            let mut header = [0u8; 5];
+            server.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], b'Q');
+            let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut body = vec![0u8; len - 4];
+            server.read_exact(&mut body).await.unwrap();
+            assert_eq!(body.last(), Some(&0));
+            let q_text = std::str::from_utf8(&body[..body.len() - 1]).unwrap();
+            assert_eq!(q_text, "RESET ALL");
+
+            // Reply CommandComplete + ReadyForQuery('I').
+            let mut script = Vec::new();
+            script.extend(pg_frame(b'C', b"RESET\0"));
+            script.extend(pg_frame(b'Z', &[b'I']));
+            server.write_all(&script).await.unwrap();
+            server.shutdown().await.ok();
+        });
+
+        super::reset_raw_session(&mut client, "RESET ALL")
+            .await
+            .expect("reset must succeed when server returns Z('I')");
+        server_task.await.unwrap();
+    }
+
+    /// If the server responds with ReadyForQuery in a non-idle state
+    /// (e.g. mid-aborted-transaction `'E'`), reset_raw_session must
+    /// reject the conn so the pool discards it.
+    #[tokio::test]
+    async fn reset_raw_session_rejects_non_idle_status() {
+        let (mut server, mut client) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            // Drain whatever the client wrote.
+            let mut header = [0u8; 5];
+            server.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut body = vec![0u8; len - 4];
+            server.read_exact(&mut body).await.unwrap();
+
+            let mut script = Vec::new();
+            script.extend(pg_frame(b'C', b"RESET\0"));
+            // 'E' = mid-aborted-transaction: server is willing to talk
+            // but the conn has dirty state.
+            script.extend(pg_frame(b'Z', &[b'E']));
+            server.write_all(&script).await.unwrap();
+            server.shutdown().await.ok();
+        });
+
+        let res = super::reset_raw_session(&mut client, "RESET ALL").await;
+        assert!(res.is_err(), "non-idle Z must be treated as failure");
+        server_task.await.unwrap();
     }
 }
