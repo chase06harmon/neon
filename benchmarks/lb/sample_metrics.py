@@ -45,6 +45,12 @@ METRICS_OF_INTEREST: list[tuple[str, str, dict[str, str] | None]] = [
     ("checkout_failed", "proxy_tcp_pool_checkout_total", {"outcome": "failed"}),
     ("overflow_taken", "proxy_tcp_pool_overflow_connections_total", {"outcome": "taken"}),
     ("overflow_refused", "proxy_tcp_pool_overflow_connections_total", {"outcome": "refused"}),
+    # Pre-existing counters that are present on BOTH the old (bb8) and
+    # new (custom) pool builds. Live backend conn count = opened - closed.
+    # Used by the comparison plotter when one of the two binaries does not
+    # emit the new proxy_tcp_pool_connections gauge.
+    ("opened_db_conns_tcp", "proxy_opened_db_connections_total", {"protocol": "tcp"}),
+    ("closed_db_conns_tcp", "proxy_closed_db_connections_total", {"protocol": "tcp"}),
 ]
 
 # Prometheus text exposition format: each metric line looks like
