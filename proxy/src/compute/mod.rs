@@ -399,6 +399,12 @@ pub struct ComputeConnection {
     pub ssl_mode: SslMode,
     pub socket_addr: SocketAddr,
     pub guage: NumDbConnectionsGuard<'static>,
+    /// Per-target open-conn counter guard (compute load balancer). When
+    /// the load balancer picks a target, the resulting ComputeConnection
+    /// holds a guard that decrements that target's counter on drop.
+    /// `None` when the LB is uninitialized or the LB policy is `none`
+    /// with a single-target path.
+    pub _lb_guard: Option<crate::compute_lb::ComputeLbGuard>,
 }
 
 impl ConnectInfo {
@@ -427,6 +433,14 @@ impl ConnectInfo {
         );
 
         let stream = StartupStream::new(stream);
+        // Track this physical connection against the LB's per-target
+        // counter so subsequent picks see updated load. The host/port
+        // string mirrors what the mock control plane uses when scoring,
+        // so the guard decrements the right bucket on drop.
+        let lb_guard = crate::compute_lb::lb_opt().map(|lb| {
+            let key = format!("{}:{}", self.host, self.port);
+            lb.track_open(key)
+        });
         let connection = ComputeConnection {
             stream,
             socket_addr,
@@ -434,6 +448,7 @@ impl ConnectInfo {
             ssl_mode: self.ssl_mode,
             aux: aux.clone(),
             guage: Metrics::get().proxy.db_connections.guard(ctx.protocol()),
+            _lb_guard: lb_guard,
         };
 
         Ok(connection)

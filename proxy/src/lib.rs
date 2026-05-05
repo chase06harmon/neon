@@ -84,6 +84,7 @@ mod cache;
 mod cancellation;
 mod compute;
 mod compute_ctl;
+mod compute_lb;
 mod config;
 mod console_redirect_proxy;
 mod context;

@@ -229,6 +229,7 @@ pub(crate) async fn reset_session(
         ssl_mode,
         socket_addr,
         guage,
+        _lb_guard,
     } = conn;
 
     let mut raw_stream = stream.into_framed().into_inner();
@@ -241,6 +242,7 @@ pub(crate) async fn reset_session(
         ssl_mode,
         socket_addr,
         guage,
+        _lb_guard,
     })
 }
 

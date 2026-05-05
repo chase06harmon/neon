@@ -53,7 +53,10 @@ impl From<tokio_postgres::Error> for ControlPlaneError {
 pub struct MockControlPlane {
     auth_endpoint: ApiUrl,
     compute_endpoint: Option<ApiUrl>,
-    compute_endpoint_map: HashMap<EndpointId, ApiUrl>,
+    /// Per-endpoint candidate compute targets. A `Vec` so a single
+    /// endpoint can fan out across multiple computes — the load balancer
+    /// (`crate::compute_lb`) picks one per new physical backend.
+    compute_endpoint_map: HashMap<EndpointId, Vec<ApiUrl>>,
     ip_allowlist_check_enabled: bool,
 }
 
@@ -61,7 +64,7 @@ impl MockControlPlane {
     pub fn new(
         auth_endpoint: ApiUrl,
         compute_endpoint: Option<ApiUrl>,
-        compute_endpoint_map: HashMap<EndpointId, ApiUrl>,
+        compute_endpoint_map: HashMap<EndpointId, Vec<ApiUrl>>,
         ip_allowlist_check_enabled: bool,
     ) -> Self {
         Self {
@@ -182,11 +185,31 @@ impl MockControlPlane {
 
     async fn do_wake_compute(&self, endpoint: &EndpointId) -> Result<NodeInfo, WakeComputeError> {
         // Lookup priority: per-endpoint map → global override → auth endpoint.
-        let target = self
-            .compute_endpoint_map
-            .get(endpoint)
-            .or(self.compute_endpoint.as_ref())
-            .unwrap_or(&self.auth_endpoint);
+        // The map may carry multiple candidates per endpoint; the load
+        // balancer (initialized once at startup) picks one. For
+        // single-target lookups the picker trivially returns that target.
+        let target: &ApiUrl = if let Some(candidates) = self.compute_endpoint_map.get(endpoint) {
+            // Address each candidate by host:port for the LB scoring map.
+            let host_ports: Vec<String> = candidates
+                .iter()
+                .map(|u| {
+                    format!(
+                        "{}:{}",
+                        u.host_str().unwrap_or("localhost"),
+                        u.port().unwrap_or(5432)
+                    )
+                })
+                .collect();
+            let idx = match crate::compute_lb::lb_opt() {
+                Some(lb) => lb.pick_index(&host_ports),
+                None => 0,
+            };
+            &candidates[idx]
+        } else if let Some(c) = self.compute_endpoint.as_ref() {
+            c
+        } else {
+            &self.auth_endpoint
+        };
         let port = target.port().unwrap_or(5432);
         let ssl_mode = parse_ssl_mode(target)?;
         let conn_info = match target.host_str() {

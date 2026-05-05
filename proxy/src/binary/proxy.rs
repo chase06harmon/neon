@@ -117,12 +117,22 @@ struct ProxyCliArgs {
     #[clap(long)]
     compute_endpoint: Option<String>,
     /// Per-endpoint compute routing for `--auth-backend=postgres`.
-    /// Comma-separated `endpoint_id=postgresql://host:port/db?sslmode=...` entries.
+    /// Comma-separated `endpoint_id=url[|url...]` entries. Each entry
+    /// can carry multiple `|`-separated URLs; the load balancer
+    /// (`--compute-lb-policy`) picks one per new physical backend.
     /// Lookup priority: this map → `--compute-endpoint` → `--auth-endpoint`.
-    /// Example: `ep-A=postgresql://localhost:5433/db?sslmode=disable,ep-B=postgresql://localhost:5434/db?sslmode=disable`
+    /// Example: `ep-A=postgresql://localhost:5433/db?sslmode=disable|postgresql://localhost:5434/db?sslmode=disable`
     #[cfg(any(test, feature = "testing"))]
     #[clap(long)]
     compute_endpoint_map: Option<String>,
+    /// Compute-target load balancer policy. Only meaningful when an
+    /// endpoint resolves to multiple URLs (via `--compute-endpoint-map`
+    /// with `|` separators). `none` (default) picks the first listed
+    /// candidate; `round-robin` distributes by atomic counter; `p2c`
+    /// uses power-of-two-choices scored by current open backend
+    /// connections per target.
+    #[clap(long, value_enum, default_value_t = crate::compute_lb::LbPolicy::None)]
+    compute_lb_policy: crate::compute_lb::LbPolicy,
     /// JWT used to connect to control plane.
     #[clap(
         long,
@@ -680,6 +690,11 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// ProxyConfig is created at proxy startup, and lives forever.
 fn build_config(args: &ProxyCliArgs) -> anyhow::Result<&'static ProxyConfig> {
+    // Initialize the compute load balancer once before any wake_compute
+    // call can run. The mock control plane reads it via `compute_lb::lb_opt()`
+    // when picking among multiple candidates for an endpoint.
+    crate::compute_lb::init(args.compute_lb_policy);
+
     let thread_pool = ThreadPool::new(args.scram_thread_pool_size);
     Metrics::get()
         .proxy
@@ -1040,10 +1055,11 @@ fn parse_compute_endpoint(endpoint: &str) -> anyhow::Result<ApiUrl> {
 #[cfg(any(test, feature = "testing"))]
 fn parse_compute_endpoint_map(
     input: &str,
-) -> anyhow::Result<std::collections::HashMap<crate::types::EndpointId, ApiUrl>> {
-    let mut map = std::collections::HashMap::new();
+) -> anyhow::Result<std::collections::HashMap<crate::types::EndpointId, Vec<ApiUrl>>> {
+    let mut map: std::collections::HashMap<crate::types::EndpointId, Vec<ApiUrl>> =
+        std::collections::HashMap::new();
     for entry in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (id, url_str) = entry.split_once('=').with_context(|| {
+        let (id, urls_str) = entry.split_once('=').with_context(|| {
             format!("compute-endpoint-map entry missing '=' separator: {entry}")
         })?;
         let id = id.trim();
@@ -1051,8 +1067,19 @@ fn parse_compute_endpoint_map(
             !id.is_empty(),
             "compute-endpoint-map entry has empty endpoint id: {entry}"
         );
-        let url = parse_compute_endpoint(url_str.trim())?;
-        let prev = map.insert(crate::types::EndpointId::from(id), url);
+        // Pipe-delimited list: `ep=url1|url2|...`. Each entry must be a
+        // valid compute endpoint URL.
+        let urls = urls_str
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(parse_compute_endpoint)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
+            !urls.is_empty(),
+            "compute-endpoint-map entry has no urls: {entry}"
+        );
+        let prev = map.insert(crate::types::EndpointId::from(id), urls);
         ensure!(
             prev.is_none(),
             "compute-endpoint-map has duplicate entry for endpoint id: {id}"

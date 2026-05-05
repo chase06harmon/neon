@@ -198,6 +198,7 @@ async fn proxy_pass_transaction_mode<S: AsyncRead + AsyncWrite + Unpin>(
         ssl_mode: postgres_client::config::SslMode,
         socket_addr: std::net::SocketAddr,
         guage: crate::metrics::NumDbConnectionsGuard<'static>,
+        lb_guard: Option<crate::compute_lb::ComputeLbGuard>,
     }
 
     fn split_compute(conn: ComputeConnection) -> (ComputeParts, MaybeRustlsStream) {
@@ -208,6 +209,7 @@ async fn proxy_pass_transaction_mode<S: AsyncRead + AsyncWrite + Unpin>(
             ssl_mode: conn.ssl_mode,
             socket_addr: conn.socket_addr,
             guage: conn.guage,
+            lb_guard: conn._lb_guard,
         };
         (parts, stream)
     }
@@ -220,6 +222,7 @@ async fn proxy_pass_transaction_mode<S: AsyncRead + AsyncWrite + Unpin>(
             ssl_mode: parts.ssl_mode,
             socket_addr: parts.socket_addr,
             guage: parts.guage,
+            _lb_guard: parts.lb_guard,
         }
     }
 
