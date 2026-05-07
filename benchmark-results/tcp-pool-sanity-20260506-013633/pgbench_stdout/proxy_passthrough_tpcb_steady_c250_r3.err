@@ -1,2 +1,0 @@
-pgbench: error: connection to server at "comp1.local.neon.build" (127.0.0.1), port 4432 failed: ERROR:  sorry, too many clients already
-pgbench: error: could not create connection for client 85
