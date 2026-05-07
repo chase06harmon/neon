@@ -1,5 +1,188 @@
-[![Neon](https://github.com/user-attachments/assets/fd91da5f-44a9-41c7-9075-36a5b5608083)](https://neon.com)
+# Local Neon Proxy Pooling Setup
 
+## 1. Create Postgres compute instances in Docker
+
+```bash
+sudo docker run -d --name compute-node-1 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=password \
+  -e POSTGRES_DB=postgres \
+  -p 5432:5432 \
+  postgres:16
+```
+
+Then update the `postgres` role password to the SCRAM value expected by the mock control plane:
+
+```bash
+docker exec -i compute-node-1 psql -U postgres -d postgres -c 'ALTER ROLE "postgres" WITH LOGIN ENCRYPTED PASSWORD '\''SCRAM-SHA-256$4096:M2ZX/kfDSd3vv5iFO/QNUA==$mookt3EiEpd/vMqGbd7df3qVwfyUfM91Ps72sNewNg4=:3nMi8eBSHggIBNSgAik6lQnE3hQcsS+myylZlYgNA1U='\'';'
+```
+
+> **Note:** This SCRAM value is stored verbatim in the mock control plane.
+
+> **Note:** You can create multiple compute nodes by repeating the process above with different container names and ports.
+
+## 2. Create an auth database
+
+Use this only if running with local auth instead of the control plane.
+
+```bash
+sudo docker run -d --name auth_db \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=password \
+  -e POSTGRES_DB=postgres \
+  -p 5434:5432 \
+  postgres:16
+```
+
+## 3. Generate SSL certificates
+
+```bash
+openssl req -new -x509 -days 365 -nodes -text \
+  -out server.crt \
+  -keyout server.key \
+  -subj "/CN=*.local.neon.build"
+```
+
+## 4. Create endpoint metadata
+
+From the project root directory, create:
+
+```text
+.neon/endpoints/<endpoint_id>/endpoint.json
+```
+
+The endpoint format is described at the bottom of this file.
+
+> **Note:** Only `pg_port` is read by the current mock control plane.
+
+> **Note:** This example uses `comp1`, `comp2`, etc. as `<endpoint_id>` values for compute nodes.
+
+## 5. Start the mock control plane REST API
+
+```bash
+RUST_LOG=info ./target/debug/proxy-cplane-api \
+  --listen 127.0.0.1:3010 \
+  --neon-local-repo-dir "$PWD/.neon" \
+  --neon-local-bin "$PWD/target/debug/neon_local"
+```
+
+## 6. Start the proxy
+
+```bash
+NEON_INTERNAL_CA_FILE=/tmp/compute-ca.crt \
+RUST_LOG=proxy \
+LOGFMT=text \
+cargo run -p proxy --bin proxy --features testing -- \
+  --auth-backend cplane-v1 \
+  --auth-endpoint http://127.0.0.1:3010 \
+  --tcp-pool-enabled true \
+  --tcp-pool-mode transaction \
+  --tcp-pool-max-conns-per-key 2 \
+  --tcp-pool-idle-timeout 30s \
+  --redis-auth-type plain \
+  --redis-plain 'redis://127.0.0.1:6379' \
+  -c server.crt \
+  -k server.key
+```
+
+> **Note:** `--tcp-pool-max-conns-per-key` can be increased above `2`.
+
+## 7. Connect with `psql`
+
+```bash
+PGSSLROOTCERT=./server.crt psql "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full"
+```
+
+# Correctness Test
+
+## 1. Initialize pgbench tables
+
+```bash
+PGSSLROOTCERT=./server.crt pgbench -i -s 10 \
+  "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full"
+```
+
+## 2. Run pgbench workload
+
+Run pgbench with 20 clients, 4 worker threads, a 60-second duration, and progress output every 5 seconds.
+
+```bash
+PGSSLROOTCERT=./server.crt pgbench -c 20 -j 4 -T 60 -P 5 -M simple \
+  "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full"
+```
+
+You can also run the same workload with `extended` or `prepared` protocol modes:
+
+```bash
+PGSSLROOTCERT=./server.crt pgbench -c 20 -j 4 -T 60 -P 5 -M extended \
+  "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full"
+```
+
+```bash
+PGSSLROOTCERT=./server.crt pgbench -c 20 -j 4 -T 60 -P 5 -M prepared \
+  "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full"
+```
+
+## 3. Run invariant correctness check
+
+After the workload finishes, verify the pgbench accounting invariant:
+
+```bash
+PGSSLROOTCERT=./server.crt psql \
+  "postgresql://postgres:password@comp1-pooler.local.neon.build:4432/postgres?sslmode=verify-full" \
+  -c "WITH sums AS (
+        SELECT
+          (SELECT COALESCE(sum(abalance), 0) FROM pgbench_accounts) AS accounts_sum,
+          (SELECT COALESCE(sum(tbalance), 0) FROM pgbench_tellers) AS tellers_sum,
+          (SELECT COALESCE(sum(bbalance), 0) FROM pgbench_branches) AS branches_sum,
+          (SELECT COALESCE(sum(delta), 0) FROM pgbench_history) AS history_sum
+      )
+      SELECT *,
+        accounts_sum = tellers_sum
+        AND tellers_sum = branches_sum
+        AND branches_sum = history_sum AS ok
+      FROM sums;"
+```
+
+The result should show:
+
+```text
+ok = t
+```
+
+# Benchmarking
+
+## 1. Start processes
+
+Start the Neon proxy and compute nodes as described above.
+
+Then start PgCat:
+
+```text
+https://github.com/postgresml/pgcat
+```
+
+## 2. Run benchmarking script
+
+Run the benchmark matrix against `proxy_pgcat`, `proxy_pool`, or `passthrough`:
+
+```bash
+env \
+  TARGETS='proxy_pgcat proxy_pool' \
+  WORKLOADS='readonly_steady readonly_connect tpcb_steady' \
+  STEADY_CONCURRENCIES='10 50 100 250' \
+  CONNECT_CONCURRENCIES='1 10 25 50 100' \
+  STEADY_DURATION='60' \
+  CONNECT_DURATION='30' \
+  REPS='3' \
+  IDLE_WAITS='15,30,45,60,90' \
+  WAIT_TARGET_SELECT='1' \
+  RESET_WAIT_SECONDS='5' \
+  SAMPLE_INTERVAL='1.0' \
+  bash scripts/run_tcp_pool_benchmark_matrix.sh
+```
+
+[![Neon](https://github.com/user-attachments/assets/fd91da5f-44a9-41c7-9075-36a5b5608083)](https://neon.com)
 
 
 # Neon
