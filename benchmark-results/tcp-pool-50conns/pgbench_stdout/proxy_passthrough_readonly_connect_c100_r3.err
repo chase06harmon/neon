@@ -1,0 +1,3 @@
+pgbench: error: connection to server at "comp1.local.neon.build" (127.0.0.1), port 4432 failed: ERROR:  Failed to acquire permit to connect to the database. Too many database connection attempts are currently ongoing.
+pgbench: error: client 2 aborted while establishing connection
+pgbench: error: Run was aborted; the above results are incomplete.

@@ -1,0 +1,13 @@
+pgbench (16.13 (Ubuntu 16.13-0ubuntu0.24.04.1))
+transaction type: <builtin: select only>
+scaling factor: 10
+query mode: simple
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 60 s
+number of transactions actually processed: 5380890
+number of failed transactions: 0 (0.000%)
+latency average = 0.556 ms
+initial connection time = 152.731 ms
+tps = 89907.676246 (without initial connection time)
